@@ -119,7 +119,7 @@ That means you can still do:
 local frame = New("Frame")({})
 local raw: Frame = frame() -- You need to manually add the type (Luau Limitation)
 
-raw():Destroy() -- works fine
+raw:Destroy() -- works fine
 (frame()::Frame):Clone()   -- also fine
 frame():AddTag() -- you lost the autocomplete
 ```
