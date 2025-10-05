@@ -3,6 +3,33 @@ local UserInputService = game:GetService("UserInputService")
 local Framework = {}
 
 -- =========================================================
+-- Update Batching System
+-- =========================================================
+local updateQueue = {}
+local isScheduled = false
+
+local function flushUpdates()
+	isScheduled = false
+	local toUpdate = updateQueue
+	updateQueue = {}
+
+	for fn in pairs(toUpdate) do
+		local ok, err = pcall(fn)
+		if not ok then
+			warn("Error in batched update:", err)
+		end
+	end
+end
+
+local function scheduleUpdate(fn)
+	updateQueue[fn] = true
+	if not isScheduled then
+		isScheduled = true
+		task.defer(flushUpdates)
+	end
+end
+
+-- =========================================================
 -- Default Props
 -- =========================================================
 local defaultProps = {
@@ -144,52 +171,88 @@ end
 export type StateObject<T> = {
 	_value: T,
 	_changed: any,
-	get: (self: StateObject<T>) -> T,
-	set: (self: StateObject<T>, val: T) -> (),
-	onChange: (self: StateObject<T>, fn: (T) -> ()) -> any,
+	get: (StateObject<T>) -> T,
+	set: (StateObject<T>, val: T) -> (),
+	onChange: (StateObject<T>, fn: (T) -> ()) -> any,
+	destroy: (StateObject<T>) -> (),
 }
 export type State<T> = StateObject<T>
 
-local currentTracker: { any }? = nil
+local stateCleanupRegistry = setmetatable({}, { __mode = "k" })
+
 local function isState(obj: any): boolean
 	return typeof(obj) == "table" and obj.get and obj.set and obj.onChange ~= nil
 end
 
 local function state<T>(initial: T): State<T>
-	local self = { _value = initial, _changed = createSignal() }
+	local stateObj = {
+		_value = initial,
+		_changed = createSignal(),
+	}
 
-	function self:get(): T
-		if currentTracker then
-			currentTracker[#currentTracker + 1] = self
-		end
+	function stateObj.get(self): T
 		return self._value
 	end
 
-	function self:set(val: T)
+	function stateObj.set(self, val: T)
+		-- Better equality check
 		if self._value == val then
 			return
 		end
+
+		-- Deep comparison for tables
 		if typeof(self._value) == "table" and typeof(val) == "table" then
-			local changed = false
-			for k, v in pairs(val) do
-				if self._value[k] ~= v then
-					changed = true
-					break
+			local function deepEquals(a, b)
+				if a == b then
+					return true
 				end
+				if typeof(a) ~= typeof(b) then
+					return false
+				end
+				if typeof(a) ~= "table" then
+					return false
+				end
+
+				for k, v in pairs(a) do
+					if not deepEquals(v, b[k]) then
+						return false
+					end
+				end
+				for k in pairs(b) do
+					if a[k] == nil then
+						return false
+					end
+				end
+				return true
 			end
-			if not changed then
+
+			if deepEquals(self._value, val) then
 				return
 			end
 		end
+
 		self._value = val
-		self._changed:Fire(val)
+		scheduleUpdate(function()
+			self._changed:Fire(val)
+		end)
 	end
 
-	function self:onChange(fn)
+	function stateObj.onChange(self, fn)
 		return self._changed:Connect(fn)
 	end
 
-	return (self :: any) :: State<T>
+	function stateObj.destroy(self)
+		if self._changed then
+			-- Disconnect all listeners
+			self._changed = createSignal() -- Reset signal
+		end
+		stateCleanupRegistry[self] = nil
+	end
+
+	-- Register for cleanup tracking
+	stateCleanupRegistry[stateObj] = true
+
+	return (stateObj :: any) :: State<T>
 end
 Framework.State = state
 
@@ -209,29 +272,37 @@ export type ReactiveValue =
 	| { [any]: any }
 export type ReactiveProp<R = ReactiveValue> = R | State<R> | (() -> R)
 
-export type PropertyTable<I = Instance> = {
+export type Proxy<I> = (() -> I) & I
+
+-- Base property table for all instances
+export type BasePropertyTable<I = Instance> = {
 	[string]: ReactiveProp<any>?,
 	Children: { Instance | { Instance } }?,
-	Ref: ((self: I) -> (() -> ())?)?,
+	Ref: ((self: Proxy<I>) -> (() -> ())?)?,
 	Draggable: boolean?,
-	OnEnter: ((self: I) -> ())?,
-	OnLeave: ((self: I) -> ())?,
-	OnDown: ((self: I) -> ())?,
-	OnUp: ((self: I) -> ())?,
-	OnActivated: ((self: I) -> ())?,
-	OnDragStart: ((self: I, startPos: UDim2, inputPos: Vector2) -> ())?,
-	OnDrag: ((self: I, delta: Vector2, inputPos: Vector2) -> ())?,
-	OnDragEnd: ((self: I, inputPos: Vector2) -> ())?,
+	OnEnter: ((self: Proxy<I>) -> ())?,
+	OnLeave: ((self: Proxy<I>) -> ())?,
+	OnDragStart: ((self: Proxy<I>, startPos: UDim2, inputPos: Vector2) -> ())?,
+	OnDrag: ((self: Proxy<I>, delta: Vector2, inputPos: Vector2) -> ())?,
+	OnDragEnd: ((self: Proxy<I>, inputPos: Vector2) -> ())?,
 }
 
-export type Proxy<I> = I & (() -> I) -- TODO: Somehow the type for exposing the instance is not working
+-- Extended property table for GuiButton instances
+export type ButtonPropertyTable<I = GuiButton> = BasePropertyTable<I> & {
+	OnDown: ((self: Proxy<I>) -> ())?,
+	OnUp: ((self: Proxy<I>) -> ())?,
+	OnActivated: ((self: Proxy<I>) -> ())?,
+}
+
+-- Main property table type (defaults to base)
+export type PropertyTable<I = Instance> = BasePropertyTable<I>
 
 -- Full constructor overloads for better type inference
 export type NewConstructor =
 	((className: "Frame") -> (props: PropertyTable<Frame>) -> Proxy<Frame>)
-	& ((className: "TextButton") -> (props: PropertyTable<TextButton>) -> Proxy<TextButton>)
+	& ((className: "TextButton") -> (props: ButtonPropertyTable<TextButton>) -> Proxy<TextButton>)
 	& ((className: "TextLabel") -> (props: PropertyTable<TextLabel>) -> Proxy<TextLabel>)
-	& ((className: "ImageButton") -> (props: PropertyTable<ImageButton>) -> Proxy<ImageButton>)
+	& ((className: "ImageButton") -> (props: ButtonPropertyTable<ImageButton>) -> Proxy<ImageButton>)
 	& ((className: "ImageLabel") -> (props: PropertyTable<ImageLabel>) -> Proxy<ImageLabel>)
 	& ((className: "ScrollingFrame") -> (props: PropertyTable<ScrollingFrame>) -> Proxy<ScrollingFrame>)
 	& ((className: "ViewportFrame") -> (props: PropertyTable<ViewportFrame>) -> Proxy<ViewportFrame>)
@@ -259,6 +330,7 @@ export type NewConstructor =
 -- Children Updater with Diffing
 -- =========================================================
 local childCache = setmetatable({}, { __mode = "k" })
+local childCleanupConnections = setmetatable({}, { __mode = "k" })
 
 local function updateChildren(parent: Instance, newChildren: { any })
 	local cache = childCache[parent] or {}
@@ -295,6 +367,14 @@ local function updateChildren(parent: Instance, newChildren: { any })
 	end
 
 	childCache[parent] = used
+
+	-- Setup cleanup for parent destruction
+	if not childCleanupConnections[parent] then
+		childCleanupConnections[parent] = parent.Destroying:Connect(function()
+			childCache[parent] = nil
+			childCleanupConnections[parent] = nil
+		end)
+	end
 end
 
 -- =========================================================
@@ -319,20 +399,9 @@ local function NewImpl(className: string)
 		-- children reactivity
 		local function applyChildren(val: any)
 			if typeof(val) == "function" then
-				local deps = {}
 				local function run()
-					for _, conn in ipairs(deps) do
-						conn:Disconnect()
-					end
-					deps = {}
-					local touched = {}
-					currentTracker = touched
 					local result = val()
-					currentTracker = nil
 					updateChildren(instance, result or {})
-					for _, st in ipairs(touched) do
-						deps[#deps + 1] = st:onChange(run)
-					end
 				end
 				run()
 			elseif isState(val) then
@@ -359,22 +428,8 @@ local function NewImpl(className: string)
 					instance[k] = newVal
 				end)
 			elseif typeof(v) == "function" and k ~= "Children" then
-				local deps = {}
-				local function run()
-					for _, conn in ipairs(deps) do
-						conn:Disconnect()
-					end
-					deps = {}
-					local touched = {}
-					currentTracker = touched
-					local result = v()
-					currentTracker = nil
-					instance[k] = result
-					for _, st in ipairs(touched) do
-						deps[#deps + 1] = st:onChange(run)
-					end
-				end
-				run()
+				local result = v()
+				instance[k] = result
 			elseif k == "Children" then
 				applyChildren(v)
 			else
@@ -408,28 +463,28 @@ local function NewImpl(className: string)
 		-- events
 		if props.OnEnter then
 			instance.MouseEnter:Connect(function()
-				props.OnEnter(proxy)
+				props.OnEnter(proxy :: any)
 			end)
 		end
 		if props.OnLeave then
 			instance.MouseLeave:Connect(function()
-				props.OnLeave(proxy)
+				props.OnLeave(proxy :: any)
 			end)
 		end
 		if instance:IsA("GuiButton") then
-			if props.OnDown then
+			if props.OnDown and typeof(props.OnDown) == "function" then
 				instance.MouseButton1Down:Connect(function()
-					props.OnDown(proxy)
+					(props.OnDown :: any)(proxy :: any)
 				end)
 			end
-			if props.OnUp then
+			if props.OnUp and typeof(props.OnUp) == "function" then
 				instance.MouseButton1Up:Connect(function()
-					props.OnUp(proxy)
+					(props.OnUp :: any)(proxy :: any)
 				end)
 			end
-			if props.OnActivated then
+			if props.OnActivated and typeof(props.OnActivated) == "function" then
 				instance.Activated:Connect(function()
-					props.OnActivated(proxy)
+					(props.OnActivated :: any)(proxy :: any)
 				end)
 			end
 		end
@@ -449,7 +504,7 @@ local function NewImpl(className: string)
 					local startPos = (instance :: GuiObject).Position
 					local lastPos = input.Position
 					if props.OnDragStart then
-						props.OnDragStart(proxy, startPos, lastPos)
+						props.OnDragStart(proxy :: any, startPos, lastPos)
 					end
 
 					dragConn = UserInputService.InputChanged:Connect(function(move)
@@ -466,7 +521,7 @@ local function NewImpl(className: string)
 								)
 							end
 							if props.OnDrag then
-								props.OnDrag(proxy, delta, currentPos)
+								props.OnDrag(proxy :: any, delta, currentPos)
 							end
 						end
 					end)
@@ -479,7 +534,7 @@ local function NewImpl(className: string)
 							end
 							activeInput = nil
 							if props.OnDragEnd then
-								props.OnDragEnd(proxy, lastPos)
+								props.OnDragEnd(proxy :: any, lastPos)
 							end
 						end
 					end)
@@ -501,8 +556,41 @@ end
 
 Framework.New = (NewImpl :: any) :: NewConstructor
 
+-- Error boundary (now that Framework.New is defined)
+local function createErrorBoundary(fallbackComponent)
+	return function(component)
+		return function(props)
+			local ok, result = pcall(component, props)
+			if ok then
+				return result
+			else
+				warn("Component error:", result)
+				if fallbackComponent then
+					return fallbackComponent(props, result)
+				end
+				return Framework.New("TextLabel")({
+					Text = game:GetService("RunService"):IsStudio() and ("Error: " .. tostring(result))
+						or "Component Error",
+					TextColor3 = Color3.new(1, 0, 0),
+					BackgroundColor3 = Color3.new(1, 1, 1),
+					Size = UDim2.new(1, 0, 0, 50),
+				})
+			end
+		end
+	end
+end
+
+Framework.ErrorBoundary = createErrorBoundary
+
 -- =========================================================
--- Helpers
+-- Fragment Component
+-- =========================================================
+function Framework.Fragment(render: () -> { Instance }): { Instance }
+	return render()
+end
+
+-- =========================================================
+-- Map Component
 -- =========================================================
 function Framework.Map<T>(array: { T }, render: (item: T, index: number) -> Instance)
 	local results = {}
