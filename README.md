@@ -6,6 +6,8 @@ Yo! I cooked up something called **Katalyst**  a simple & small UI framework tha
 
 ---
 
+[Documentation Website](https://katalyst.miukyo.my.id) - For more information
+
 **🧩 Core Idea**
 
 Katalyst wraps Roblox ui instances in a **proxy** so you can:
